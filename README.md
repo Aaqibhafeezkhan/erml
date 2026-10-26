@@ -119,6 +119,11 @@ raw_list = [r.model_dump() for r in results]
 
 Returns `[]` if no face is detected. Never raises on empty input.
 
+### Edge cases and low-confidence predictions
+
+See [Edge cases and interpreting predictions](docs/edge-cases.md) for no-face and multi-face behavior, a confidence-threshold example, and responsible interpretation of expression labels.
+
+
 ### Human-readable output
 
 ```python
@@ -133,6 +138,23 @@ print(format_results(detector.analyze("photo.jpg")))
 `angry` · `disgust` · `fear` · `happy` · `sad` · `surprise` · `neutral`
 
 Trained on [FER-2013](https://www.kaggle.com/datasets/msambare/fer2013).
+
+
+## CPU inference benchmark
+
+Run the benchmark on the machine you want to evaluate, using an image representative of your workload:
+
+~~~bash
+python scripts/benchmark_cpu.py tests/sample_faces/happy_face.jpg
+~~~
+
+By default, the script benchmarks 320×240, 640×480, and 1280×720 images with 5 warm-up runs and 30 timed runs per size. Adjust the image, sizes, and iteration counts to match your workload:
+
+~~~bash
+python scripts/benchmark_cpu.py path/to/image.jpg --iterations 50 --warmup 5 --sizes 320x240 640x480 1920x1080 --json benchmark-results.json
+~~~
+
+The script uses ONNX Runtime's CPU execution provider and limits OpenCV to one thread. It reports minimum, median, 95th-percentile, and maximum latency in milliseconds, along with CPU, OS, Python, OpenCV, and ONNX Runtime details. Timings cover analyze() (face detection plus inference for detected faces); model initialization and first-run downloads are excluded. Each input is resized to the target dimensions, so use a representative image and record its source dimensions and detected face count. Run on an otherwise idle machine. Results from different machines or images are not directly comparable.
 
 ## Training
 
