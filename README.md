@@ -119,6 +119,22 @@ raw_list = [r.model_dump() for r in results]
 
 Returns `[]` if no face is detected. Never raises on empty input.
 
+### Batch processing
+
+Process multiple images in a single call using `analyze_batch()`:
+
+```python
+frames = ["face1.jpg", "face2.jpg", "group.jpg"]
+batch_results = detector.analyze_batch(frames)
+
+for image_path, faces in zip(frames, batch_results):
+    print(f"{image_path}: {len(faces)} faces detected")
+    for face in faces:
+        print(f"  {face.emotion} ({face.confidence:.2f})")
+```
+
+`analyze_batch()` batches ONNX emotion inference across detected face crops while preserving input image ordering. If an image contains no faces, its corresponding entry is `[]`.
+
 ### Edge cases and low-confidence predictions
 
 See [Edge cases and interpreting predictions](docs/edge-cases.md) for no-face and multi-face behavior, a confidence-threshold example, and responsible interpretation of expression labels.

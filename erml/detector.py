@@ -12,7 +12,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Sequence, Union
 
 # Suppress OpenCV / ONNX verbosity.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -120,14 +120,14 @@ class EmotionDetector:
 
     def analyze(
         self,
-        frame: Union[np.ndarray, str, PILImage],
+        frame: Union[np.ndarray, str, os.PathLike, PILImage],
     ) -> List[FacePrediction]:
         """Detect faces in a frame and return per-face emotion scores.
 
         Args:
             frame: Input image as one of:
                 - numpy array (BGR, as returned by OpenCV)
-                - str file path to an image readable by OpenCV
+                - str or os.PathLike file path to an image readable by OpenCV
                 - PIL.Image object
 
         Returns:
@@ -176,18 +176,111 @@ class EmotionDetector:
 
         return results
 
+    def analyze_batch(
+        self,
+        frames: Sequence[Union[np.ndarray, str, os.PathLike, PILImage]],
+        batch_size: int = 32,
+    ) -> List[List[FacePrediction]]:
+        """Detect faces in a batch of frames and return emotion predictions per image.
+
+        Face detection (YuNet) is performed for each input frame, and detected face
+        crops are batched into chunks of size ``batch_size`` for ONNX inference.
+
+        Args:
+            frames: Sequence of input images. Each image can be a numpy array (BGR),
+                file path (str or os.PathLike), or PIL.Image.
+            batch_size: Maximum number of face crops to infer simultaneously in a
+                single ONNX forward pass (default: 32). Must be >= 1.
+
+        Returns:
+            List of lists of :class:`~erml.schemas.FacePrediction` objects, one list
+            per input frame in the corresponding order. If an input frame has no
+            detected faces, its corresponding entry is an empty list (``[]``).
+            If ``frames`` is empty, returns an empty list (``[]``).
+
+        Raises:
+            ValueError: If ``batch_size < 1``, or if a file path is given but cannot
+                be read or does not exist.
+            TypeError: If an element in ``frames`` is not a supported input type,
+                or if ``frames`` is not iterable.
+        """
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+        try:
+            frame_list = list(frames)
+        except TypeError as exc:
+            raise TypeError(
+                f"frames must be an iterable/sequence of images, "
+                f"got {type(frames).__name__}"
+            ) from exc
+
+        if not frame_list:
+            return []
+
+        # Validate and convert all frames first to fail fast on invalid inputs.
+        bgr_frames = [self._to_bgr(f) for f in frame_list]
+
+        # Container for results per image
+        results: List[List[FacePrediction]] = [[] for _ in range(len(frame_list))]
+
+        # Detect faces across all frames and collect face crops
+        face_metadata: List[tuple[int, int, int, int, int]] = []
+        all_rois: List[np.ndarray] = []
+
+        for frame_idx, bgr in enumerate(bgr_frames):
+            if bgr is None or bgr.size == 0:
+                continue
+            faces = self._detect_faces(bgr)
+            for x, y, w, h in faces:
+                roi = bgr[y : y + h, x : x + w]
+                all_rois.append(preprocess_face(roi))
+                face_metadata.append((frame_idx, int(x), int(y), int(w), int(h)))
+
+        if not all_rois:
+            return results
+
+        # Run ONNX inference in bounded chunks
+        stacked = np.concatenate(all_rois, axis=0)
+        preds_chunks: List[np.ndarray] = []
+        for i in range(0, len(all_rois), batch_size):
+            chunk = stacked[i : i + batch_size]
+            outputs = self._session.run(None, {self._input_name: chunk})
+            preds_chunks.append(outputs[0])
+
+        all_preds = np.concatenate(preds_chunks, axis=0)
+
+        # Reconstruct structured FacePrediction per frame
+        for i, (frame_idx, x, y, w, h) in enumerate(face_metadata):
+            predictions = all_preds[i]
+            top_idx = int(np.argmax(predictions))
+            all_scores = {
+                label: float(predictions[idx])
+                for idx, label in enumerate(EMOTION_LABELS)
+            }
+            results[frame_idx].append(
+                FacePrediction(
+                    emotion=EMOTION_LABELS[top_idx],
+                    confidence=float(predictions[top_idx]),
+                    all=all_scores,
+                    bbox=BoundingBox(x=x, y=y, w=w, h=h),
+                )
+            )
+
+        return results
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _to_bgr(
         self,
-        frame: Union[np.ndarray, str, PILImage],
+        frame: Union[np.ndarray, str, os.PathLike, PILImage],
     ) -> np.ndarray:
         """Convert any supported input type to a BGR numpy array.
 
         Args:
-            frame: Input image (numpy array, file path string, or PIL Image).
+            frame: Input image (numpy array, file path string/Path, or PIL Image).
 
         Returns:
             BGR numpy array, or None if the input is empty / unreadable.
@@ -199,12 +292,13 @@ class EmotionDetector:
         if isinstance(frame, np.ndarray):
             return frame
 
-        if isinstance(frame, str):
-            if not os.path.isfile(frame):
-                raise ValueError(f"Image file not found: {frame}")
-            img = cv2.imread(frame)
+        if isinstance(frame, (str, os.PathLike)):
+            path_str = os.fspath(frame)
+            if not os.path.isfile(path_str):
+                raise ValueError(f"Image file not found: {path_str}")
+            img = cv2.imread(path_str)
             if img is None:
-                raise ValueError(f"Could not read image file: {frame}")
+                raise ValueError(f"Could not read image file: {path_str}")
             return img
 
         # PIL.Image — import lazily to avoid hard dependency at module level.

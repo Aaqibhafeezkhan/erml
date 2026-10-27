@@ -6,3 +6,4 @@
       members:
         - __init__
         - analyze
+        - analyze_batch

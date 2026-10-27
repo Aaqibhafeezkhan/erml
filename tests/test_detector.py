@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
@@ -34,11 +35,15 @@ def _make_mock_detector(face_boxes=None):
         face_boxes = np.array([[10, 10, 60, 60]])
 
     # ONNX session mock — outputs softmax probabilities (happy wins at idx 3)
-    predictions = np.array(
-        [[0.02, 0.01, 0.02, 0.90, 0.02, 0.02, 0.01]], dtype=np.float32
-    )
     mock_session = MagicMock()
-    mock_session.run.return_value = [predictions]
+
+    def _mock_run(output_names, feed_dict):
+        chunk = feed_dict.get("input")
+        n = len(chunk) if chunk is not None else 1
+        row = [0.02, 0.01, 0.02, 0.90, 0.02, 0.02, 0.01]
+        return [np.tile(row, (n, 1)).astype(np.float32)]
+
+    mock_session.run.side_effect = _mock_run
     mock_session.get_inputs.return_value = [MagicMock(name="input")]
 
     # YuNet mock — detect() returns (retval, faces_array)
@@ -301,3 +306,170 @@ def test_analyze_raises_on_unsupported_type():
     detector, _, _ = _make_mock_detector()
     with pytest.raises(TypeError, match="Unsupported frame type"):
         detector.analyze(12345)  # type: ignore[arg-type]
+
+
+def test_analyze_accepts_pathlib_path():
+    """analyze() accepts a pathlib.Path object."""
+    happy_path = Path(SAMPLE_FACES_DIR) / "happy_face.jpg"
+    if not happy_path.is_file():
+        pytest.skip("Sample face image not available")
+
+    detector, _, mock_yunet = _make_mock_detector()
+    faces_15col = np.array([[5, 5, 40, 40, *([0.0] * 10), 0.9]], dtype=np.float32)
+    mock_yunet.detect.return_value = (1, faces_15col)
+    result = detector.analyze(happy_path)
+    assert isinstance(result, list)
+    assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# analyze_batch() tests
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_batch_empty():
+    """analyze_batch([]) returns an empty list."""
+    detector, _, _ = _make_mock_detector()
+    assert detector.analyze_batch([]) == []
+
+
+def test_analyze_batch_invalid_batch_size():
+    """analyze_batch() raises ValueError when batch_size < 1."""
+    detector, _, _ = _make_mock_detector()
+    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+        detector.analyze_batch([], batch_size=0)
+    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+        detector.analyze_batch([], batch_size=-5)
+
+
+def test_analyze_batch_non_iterable():
+    """analyze_batch() raises TypeError when frames is not iterable."""
+    detector, _, _ = _make_mock_detector()
+    with pytest.raises(TypeError, match="frames must be an iterable"):
+        detector.analyze_batch(None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="frames must be an iterable"):
+        detector.analyze_batch(123)  # type: ignore[arg-type]
+
+
+def test_analyze_batch_fails_fast_on_invalid_file():
+    """analyze_batch() raises ValueError if any file in the batch is not found."""
+    detector, _, _ = _make_mock_detector()
+    valid_frame = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="Image file not found"):
+        detector.analyze_batch([valid_frame, "/nonexistent/fake_image.jpg"])
+
+
+def test_analyze_batch_structure_and_ordering():
+    """analyze_batch() preserves order and handles images with 0/multi faces."""
+    # Frame 1: 1 face
+    # Frame 2: 0 faces
+    # Frame 3: 2 faces
+    detector, _, mock_yunet = _make_mock_detector()
+
+    face1 = np.array([[5, 5, 20, 20, *([0.0] * 10), 0.9]], dtype=np.float32)
+    face2_none = None
+    face3_two = np.array(
+        [
+            [10, 10, 30, 30, *([0.0] * 10), 0.9],
+            [50, 50, 30, 30, *([0.0] * 10), 0.85],
+        ],
+        dtype=np.float32,
+    )
+
+    mock_yunet.detect.side_effect = [
+        (1, face1),
+        (0, face2_none),
+        (2, face3_two),
+    ]
+
+    f1 = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+    f2 = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+    f3 = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+
+    results = detector.analyze_batch([f1, f2, f3])
+    assert len(results) == 3
+    assert len(results[0]) == 1
+    assert len(results[1]) == 0
+    assert len(results[2]) == 2
+    assert results[0][0].bbox.x == 5
+    assert results[2][0].bbox.x == 10
+    assert results[2][1].bbox.x == 50
+
+
+def test_analyze_batch_chunking_consistency():
+    """analyze_batch() produces identical output regardless of batch_size chunking."""
+    detector, _, mock_yunet = _make_mock_detector()
+
+    faces = np.array(
+        [
+            [5, 5, 20, 20, *([0.0] * 10), 0.9],
+            [30, 30, 20, 20, *([0.0] * 10), 0.9],
+        ],
+        dtype=np.float32,
+    )
+    mock_yunet.detect.return_value = (2, faces)
+
+    f1 = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+    f2 = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+
+    # 4 faces total: batch_size=1 runs 4 chunks, batch_size=10 runs 1 chunk
+    res_chunked = detector.analyze_batch([f1, f2], batch_size=1)
+    res_single = detector.analyze_batch([f1, f2], batch_size=10)
+
+    assert len(res_chunked) == len(res_single) == 2
+    for r_c, r_s in zip(res_chunked, res_single):
+        assert len(r_c) == len(r_s) == 2
+        for p_c, p_s in zip(r_c, r_s):
+            assert p_c.emotion == p_s.emotion
+            assert p_c.confidence == pytest.approx(p_s.confidence, rel=1e-4, abs=1e-5)
+            assert p_c.bbox.model_dump() == p_s.bbox.model_dump()
+
+
+def test_analyze_batch_mixed_inputs(tmp_path):
+    """analyze_batch() handles numpy arrays, str, Path, and PIL images."""
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    happy_path = Path(SAMPLE_FACES_DIR) / "happy_face.jpg"
+    if not happy_path.is_file():
+        pytest.skip("Sample face image not available")
+
+    detector, _, mock_yunet = _make_mock_detector()
+    face_15 = np.array([[5, 5, 20, 20, *([0.0] * 10), 0.9]], dtype=np.float32)
+    mock_yunet.detect.return_value = (1, face_15)
+
+    arr = np.random.randint(0, 256, (80, 80, 3), dtype=np.uint8)
+    pil_img = Image.fromarray(arr, mode="RGB")
+    path_str = str(happy_path)
+    path_obj = happy_path
+
+    results = detector.analyze_batch([arr, pil_img, path_str, path_obj])
+    assert len(results) == 4
+    for r in results:
+        assert len(r) == 1
+        assert isinstance(r[0], FacePrediction)
+
+
+def test_analyze_batch_parity():
+    """Verify analyze_batch() and analyze() outputs match across runs."""
+    detector, _, mock_yunet = _make_mock_detector()
+    face = np.array([[5, 5, 40, 40, *([0.0] * 10), 0.9]], dtype=np.float32)
+    mock_yunet.detect.return_value = (1, face)
+
+    frame = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+    single_res = detector.analyze(frame)
+    batch_res = detector.analyze_batch([frame, frame])
+
+    assert len(batch_res) == 2
+    for img_res in batch_res:
+        assert len(img_res) == len(single_res)
+        for p_batch, p_single in zip(img_res, single_res):
+            assert p_batch.emotion == p_single.emotion
+            assert p_batch.bbox.model_dump() == p_single.bbox.model_dump()
+            assert p_batch.confidence == pytest.approx(
+                p_single.confidence, rel=1e-4, abs=1e-5
+            )
+            for k in p_single.all:
+                assert p_batch.all[k] == pytest.approx(
+                    p_single.all[k], rel=1e-4, abs=1e-5
+                )
